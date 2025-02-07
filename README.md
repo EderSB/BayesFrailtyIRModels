@@ -2,10 +2,10 @@
 
 ## The repository
 
-This repository contains the codes implemented from the theory presented in Manuscript "Bayesian analysis of shared frailty models for repairable systems subject to imperfect repair", as well as the database used in that work and some supplementary files.
+This repository contains the codes implemented from the theory and application presented in Manuscript "Bayesian analysis of shared frailty models for repairable systems subject to imperfect repair", as well as the database used in that work.
 
 ## Available files
 
-* The codes from estimating parameter of frailty ARA_m models;
-* The codes from estimating parameter of frailty ARI_m models;
-* The dataset "truck_data" studied in the manuscript.
+* The codes from estimating parameter for frailty ARA_m models using Bayes estimation;
+* The codes from estimating parameter for frailty ARI_m models using Bayes estimation;
+* The "truck" file thatr contains the datased studied in the manuscript.
