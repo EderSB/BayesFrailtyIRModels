@@ -1,1 +1,570 @@
+library(dplyr)
+library(tibble)
+library(SimDesign)
+library(msm)
 
+#-------------------------------------------
+# Auxiliary functions
+#-------------------------------------------
+
+v.age_components <- function(data, theta, beta, m) {
+  K = max(data$System)
+  W = numeric(K)
+  v.age.obs = NULL
+  n_k = NULL
+  
+  for (k in 1:K) {
+    data.k=data %>% filter(System==k)
+    time.k=data.k$Time
+    time.k.aux=c(0,time.k)
+    t.k.aux=c(rep(0,(m-1)),time.k.aux)
+    n_k[k]=length(time.k[-1])
+    
+    v.age.k=NULL
+    prev.age.k=NULL
+    
+    for(j in 1:length(time.k)){
+      v.age.k[j]=t.k.aux[j+m]-(1-theta[k])*sum((theta[k]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
+      prev.age.k[j]=t.k.aux[j+m-1]-(1-theta[k])*sum((theta[k]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
+    }
+    v.age.obs.k=v.age.k[-length(v.age.k)]
+    v.age.obs = c(v.age.obs, v.age.obs.k)
+    
+    W[k] = sum(v.age.k^beta - prev.age.k^beta)
+  }
+  
+  return(list(W = W, vage_obs = v.age.obs, n_k = n_k))
+}
+
+
+log.pi.theta=function(theta,beta,omega,alpha,g,h,m,time.k){
+  time.k.aux=c(0,time.k)
+  t.k.aux=c(rep(0,(m-1)),time.k.aux)
+  n_k=length(time.k[-1])
+  v.age.k=NULL
+  prev.age.k=NULL
+  for(j in 1:length(time.k)){
+    v.age.k[j]=t.k.aux[j+m]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
+    prev.age.k[j]=t.k.aux[j+m-1]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
+  }
+  v.age.obs.k=v.age.k[-length(v.age.k)]
+  #
+  resu =(beta-1)*sum(log(v.age.obs.k)) + (g-1)*log(theta) + (h-1)*log(1-theta) - 
+    (1/alpha+n_k)*sum(log(1+alpha*omega*(sum(v.age.k^beta - prev.age.k^beta))))
+  #
+  return(resu)
+}
+
+
+log.pi.beta=function(omega,beta,alpha,theta,m,data,a,b){
+  N=sum(data$Event)
+  K=max(data$System)
+  
+  calc=v.age_components(data=data, theta=theta, beta=beta, m=m)
+  
+  resu.aux= N*log(beta)+(beta-1)*sum(log(calc$vage_obs))-sum((1/alpha+calc$n_k)*log(1+alpha*omega*calc$W))
+  resu = ifelse(between(beta,a,b)==TRUE, resu.aux, 0)
+  return(resu)
+}
+
+
+log.pi.omega=function(omega,beta,alpha,theta,m,data,c,d){
+  N=sum(data$Event)
+  K=max(data$System)
+  
+  calc=v.age_components(data=data, theta=theta, beta=beta, m=m)
+  
+  resu = N*log(omega) + (c-1)*log(omega) - d*omega - sum((1/alpha+calc$n_k)*log(1+alpha*omega*calc$W))
+  return(resu)
+}
+
+
+log.pi.alpha=function(alpha,beta,omega,theta,m,data,e,f){
+  N=sum(data$Event)
+  K=max(data$System)
+  
+  calc=v.age_components(data=data, theta=theta, beta=beta, m=m)
+  
+  resu =  N*log(alpha) - K*lgamma(1/alpha) + sum(lgamma(1/alpha + calc$n_k)) -
+    sum((1/alpha+calc$n_k)*log(1+alpha*omega*calc$W)) + (e-1)*log(alpha) - f*alpha
+  return(resu)
+}
+
+
+log.pi.g=function(theta,g){
+  (g-1)*sum(log(theta))-(g-1)
+}
+
+
+log.pi.h=function(theta,h){
+  (h-1)*sum(log(1-theta))-(h-1)
+}
+
+
+generate_z = function(k, alpha) {
+  lim_var = 1.1 * alpha
+  repeat {
+    z = rgamma(k - 1, shape = 1/alpha, rate = 1/alpha)
+    z_k = k - sum(z)
+    z_tot = c(z, z_k)
+    
+    if (z_k > 0 &&
+        all(z_tot > 0) &&
+        var(z_tot) < lim_var) {
+      return(z_tot)
+    }
+  }
+}
+
+
+
+#-------------------------------------------
+# MCMC function 
+#-------------------------------------------
+
+metr0 <- function(n, data, betastart, omegastart, thetastart, alphastart, gstart, hstart, m,
+                  a, b, c, d, e, f) {
+  data=data
+  m=m
+  N=sum(data$Event)
+  K=max(data$System)
+  #
+  alpha = c(alphastart, rep(NA, n - 1))
+  beta = c(betastart, rep(NA, n-1))
+  omega = c(omegastart, rep(NA, n-1))
+  theta = matrix(NA, K, n); theta[ ,1]=thetastart
+  g = c(gstart, rep(NA, n-1))
+  h = c(hstart, rep(NA, n-1))
+  taxa.alpha = 0
+  taxa.beta = 0
+  taxa.omega = 0
+  taxa.theta = c(rep(0,K))
+  taxa.g = 0
+  taxa.h = 0
+  #
+  for (i in 2:n) {
+    
+    # estimate the thetas
+    for(k in 1:K){
+      data.k=data %>% filter(System==k)
+      time.k=data.k$Time
+      
+      #
+      theta.star = rtnorm(1, theta[k,i-1], 0.2, lower=0, upper=1)
+      #
+      log.R.theta = log.pi.theta(theta=theta.star,beta=beta[i-1],omega=omega[i-1],alpha=alpha[i-1],g=g[i-1],h=h[i-1],m=m,time.k=time.k) -
+        log.pi.theta(theta=theta[k,i-1],beta=beta[i-1],omega=omega[i-1],alpha=alpha[i-1],g=g[i-1],h=h[i-1],m=m,time.k=time.k)
+      
+      prob.theta = min(1, exp(log.R.theta))
+      
+      if(is.finite(prob.theta)){
+        if (runif(1) < prob.theta) {
+          theta[k,i] = theta.star
+          taxa.theta[k] = taxa.theta[k] + 1
+        }
+        else {
+          theta[k,i] = theta[k,i-1]
+        }
+      }  else { theta[k,i] = theta[k,i-1]}
+      
+    }
+    
+    
+    # estimate beta
+    s_d=0.5
+    beta.star = rtnorm(1, mean=beta[i-1], sd=s_d, lower=1, upper=3) 
+    
+    log.R.beta = log.pi.beta(beta=beta.star,omega=omega[i-1],alpha=alpha[i-1],theta=theta[,i],m=m,data=data,a=a,b=b) - 
+      log.pi.beta(beta=beta[i-1],omega=omega[i-1],alpha=alpha[i-1],theta=theta[,i],m=m,data=data,a=a,b=b)
+    
+    prob.beta = min(1, exp(log.R.beta))
+    
+    if(is.finite(prob.beta)){
+      if (runif(1) < prob.beta) {
+        beta[i] = beta.star
+        taxa.beta = taxa.beta + 1
+      }
+      else {
+        beta[i] = beta[i - 1]
+      }
+    }  else { beta[i] = beta[i-1]}
+    
+    
+    # estimate omega
+    
+    omega.star = rtnorm(1, omega[i-1], 0.01, lower=0, upper=0.1)
+    
+    log.R.omega = log.pi.omega(omega=omega.star,beta=beta[i],alpha=alpha[i-1],theta=theta[,i],m=m,data=data,c=c,d=d) - 
+      log.pi.omega(omega=omega[i-1],beta=beta[i],alpha=alpha[i-1],theta=theta[,i],m=m,data=data,c=c,d=d)
+    
+    prob.omega = min(1, exp(log.R.omega))
+    
+    if(is.finite(prob.omega)){
+      if (runif(1) < prob.omega) {
+        omega[i] = omega.star
+        taxa.omega = taxa.omega + 1
+      }
+      else {
+        omega[i] = omega[i-1]
+      }
+    }  else { omega[i] = omega[i-1]}
+    
+    
+    # estimate alpha
+    
+    alpha.star = rtnorm(1, alpha[i-1], 0.5 , lower=0, upper=0.5)
+    
+    log.R.alpha = log.pi.alpha(alpha=alpha.star,beta=beta[i],omega=omega[i],theta=theta[,i],m=m,data=data,e=e,f=f) - 
+      log.pi.alpha(alpha=alpha[i-1],beta=beta[i],omega=omega[i],theta=theta[,i],m=m,data=data,e=e,f=f)
+    
+    prob.alpha = min(1, exp(log.R.alpha))
+    
+    if(is.finite(prob.alpha)){
+      if (runif(1) < prob.alpha) {
+        alpha[i] = alpha.star
+        taxa.alpha = taxa.alpha + 1
+      }
+      else {
+        alpha[i] = alpha[i-1]
+      }
+    }  else { alpha[i] = alpha[i-1]}
+    
+    
+    # estimate the hyperparameter "g"
+    s_d=1
+    g.star = rtnorm(1, mean=g[i-1], sd=s_d, lower=1, upper=3) 
+    
+    
+    log.R.g = log.pi.g(g=g.star,theta=theta[,i])-log.pi.g(g=g[i-1],theta=theta[,i])
+    
+    prob.g = min(1, exp(log.R.g))
+    
+    if(is.finite(prob.g)){
+      if (runif(1) < prob.g) {
+        g[i] = g.star
+        taxa.g = taxa.g + 1
+      }
+      else {
+        g[i] = g[i - 1]
+      }
+    }  else { g[i] = g[i-1]}
+    
+    
+    # estimate the hyperparameter "f"
+    s_d=1
+    h.star = rtnorm(1, mean=h[i-1], sd=s_d, lower=1, upper=3) 
+    
+    
+    log.R.h = log.pi.h(h=h.star,theta=theta[,i])-
+      log.pi.h(h=h[i-1],theta=theta[,i])
+    
+    prob.h = min(1, exp(log.R.h))
+    
+    if(is.finite(prob.h)){
+      if (runif(1) < prob.h) {
+        h[i] = h.star
+        taxa.h = taxa.h + 1
+      }
+      else {
+        h[i] = h[i - 1]
+      }
+    }  else { h[i] = h[i-1]}
+    
+    
+    #print(paste("Iteração:", i))
+    
+  }
+  
+  return(list(beta=beta, omega=omega, theta=theta, alpha=alpha, g=g, h=h, 
+              tx.beta=taxa.beta/n, tx.omega=taxa.omega/n, tx.theta=taxa.theta/n, tx.alpha=taxa.alpha/n,
+              tx.g=taxa.g/n, tx.h=taxa.h/n))
+  
+}
+
+
+
+#-------------------------------------------
+# PLP functions 
+#-------------------------------------------
+
+lambda.est=function(t, beta, omega){
+  resu=(beta*omega)*(t^(beta-1))
+  return(resu)
+}
+
+Lambda.est=function(t, beta, omega){
+  resu=omega*(t^beta)
+  return(resu)
+}
+
+
+Lambda.inv=function(t, beta, omega){
+  resu=(t/omega)^(1/beta)
+  return(resu)
+}
+
+#-------------------------------------------
+# ARA_m functions 
+#-------------------------------------------
+
+lambda.aram.est=function(time, m, beta, omega, theta){
+  time.aux=c(0,time)
+  t.aux=c(rep(0,(m-1)),time.aux)
+  v.age=NULL
+  for(i in 1:length(time)){
+    v.age[i]=t.aux[i+m]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.aux[i:(i+m-1)])))
+  }
+  value=lambda.est(t=v.age, beta=beta, omega=omega)
+  return(value)
+}
+
+Lambda.aram.est<-function(time,m, beta, omega, theta){
+  time.aux=c(0,time)
+  t.aux=c(rep(0,(m-1)),time.aux)
+  v.age=NULL
+  v.age.aux=NULL
+  resu.aux=NULL
+  for(i in 1:length(time)){
+    v.age[i]=t.aux[i+m]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.aux[i:(i+m-1)])))
+    v.age.aux[i]=t.aux[i+m-1]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.aux[i:(i+m-1)])))
+    resu.aux[i]=Lambda.est(t=v.age[i],beta=beta,omega=omega)-
+      Lambda.est(t=v.age.aux[i],beta=beta,omega=omega)
+  }
+  resu=cumsum(resu.aux)
+  return(resu)
+}
+
+
+
+#-------------------------------------------
+# Generate failure times samples 
+#-------------------------------------------
+
+Generate <- function(condition, fixed_objects = NULL) {
+  #
+  beta = condition$beta 
+  omega = condition$omega
+  theta = c(condition$theta.1,condition$theta.2,condition$theta.3,
+            condition$theta.4,condition$theta.5)
+  alpha = condition$alpha
+  m=condition$m
+  k = condition$k
+  tau = condition$tau
+  unidade=NULL
+  t.fin=NULL
+  evento=NULL
+  #
+  
+  #z = gerar_vetor_gamma(k = k, alpha = alpha)
+  
+  for(j in 1:k){
+    #z_j=rgamma(1,shape=1/alpha, scale=alpha)
+    #
+    n = 1
+    u = runif(1,0,1)
+    tj_1=Lambda.inv(t=-(log(1-u))/z[j], beta=beta, omega=omega)
+    t = tj_1;t
+    #
+    n = 2
+    #
+    while ( tj_1<tau ) {
+      #
+      p=min((m-1),(n-2));p
+      Sj=(1-theta[j])*sum((theta[j]^c(0:p))*rev(t[(n-p-1):(n-1)])); Sj
+      #
+      tj = last(t);tj
+      uj_1 = runif(1,0,1)
+      aux_1= Lambda.est(t=(tj-Sj), beta=beta, omega=omega) - (log(1-uj_1))/z[j]
+      #
+      tj_1 = Sj + Lambda.inv(t=aux_1, beta=beta, omega=omega)
+      t=c(t,tj_1);t
+      n=n+1
+    }
+    t=t[-length(t)];t
+    t.tau = c(t,tau)
+    #
+    unidade=c(unidade, rep(j,length(t.tau)))
+    evento=c(evento, rep(1,length(t)),0)
+    t.fin = c(t.fin, t.tau)
+  }
+  
+  dat =
+    tibble(Time=c(t.fin)) %>% 
+    mutate(System = unidade) %>% 
+    mutate(Event=evento)
+  
+  
+  dat
+  #
+}
+
+
+#-------------------------------------------
+# Estimation
+#-------------------------------------------
+
+Analyse <- function(condition, dat, fixed_objects = NULL){
+  data=dat
+  beta=condition$beta
+  omega=condition$omega
+  alpha=condition$alpha
+  theta.1=condition$theta.1
+  theta.2=condition$theta.2
+  theta.3=condition$theta.3
+  theta.4=condition$theta.4
+  theta.5=condition$theta.5
+  m=condition$m
+  K=condition$k
+  #N= condition$N
+  g=condition$g
+  h=condition$h
+  
+  obs=(length(data$Time))/condition$k
+  
+  mm = metr0(n=10000, data=data, betastart=beta, omegastart=omega, alphastart=alpha,
+             thetastart=c(theta.1, theta.2, theta.3, theta.4, theta.5), 
+             gstart=g, hstart=h, m=m, a=1, b=3, c=0.01, d=1, e=1, f=1)
+  
+  x.inf=2000; x.sup=10000
+  jump=5
+  
+  alpha1=mm$alpha[seq(x.inf,x.sup,jump)]
+  beta1=mm$beta[seq(x.inf,x.sup,jump)]
+  omega1=mm$omega[seq(x.inf,x.sup,jump)]
+  g1=mm$g[seq(x.inf,x.sup,jump)]
+  h1=mm$h[seq(x.inf,x.sup,jump)]
+  
+  theta1.1=mm$theta[1,seq(x.inf,x.sup,jump)]
+  theta1.2=mm$theta[2,seq(x.inf,x.sup,jump)]
+  theta1.3=mm$theta[3,seq(x.inf,x.sup,jump)]
+  theta1.4=mm$theta[4,seq(x.inf,x.sup,jump)]
+  theta1.5=mm$theta[5,seq(x.inf,x.sup,jump)]
+  
+  chain = data.frame(beta=beta1,omega=omega1,alpha=alpha1,theta1=theta1.1,theta2=theta1.2,
+                     theta3=theta1.3,theta4=theta1.4,theta5=theta1.5)
+  
+  results = c(mean(beta1), quantile(beta1, 0.025), median(beta1), quantile(beta1, 0.975),
+              mean(omega1), quantile(omega1, 0.025), median(omega1), quantile(omega1, 0.975),
+              mean(alpha1), quantile(alpha1, 0.025), median(alpha1), quantile(alpha1, 0.975),
+              mean(theta1.1), quantile(theta1.1, 0.025), median(theta1.1), quantile(theta1.1, 0.975),
+              mean(theta1.2), quantile(theta1.2, 0.025), median(theta1.2), quantile(theta1.2, 0.975),
+              mean(theta1.3), quantile(theta1.3, 0.025), median(theta1.3), quantile(theta1.3, 0.975),
+              mean(theta1.4), quantile(theta1.4, 0.025), median(theta1.4), quantile(theta1.4, 0.975),
+              mean(theta1.5), quantile(theta1.5, 0.025), median(theta1.5), quantile(theta1.5, 0.975),obs
+  )
+  
+  results = results %>%  setNames(c('x.beta','l.beta','m.beta','u.beta',
+                                    'x.omega','l.omega','m.omega','u.omega',
+                                    'x.alpha','l.alpha','m.alpha','u.alpha',
+                                    'x.theta_1','l.theta_1','m.theta_1','u.theta_1',
+                                    'x.theta_2','l.theta_2','m.theta_2','u.theta_2',
+                                    'x.theta_3','l.theta_3','m.theta_3','u.theta_3',
+                                    'x.theta_4','l.theta_4','m.theta_4','u.theta_4',
+                                    'x.theta_5','l.theta_5','m.theta_5','u.theta_5','obs'))
+  results
+  # ---
+}
+
+
+
+#-------------------------------------------
+# Summarise results
+#-------------------------------------------
+
+Summarise <- function(condition, results, fixed_objects = NULL) {
+  n_row=nrow(results)
+  resu=as.data.frame(results)
+  obs_media_beta <- mean(resu[,1], parameter=3)
+  obs_media_omega <- mean(resu[,5], parameter = 3)
+  obs_media_alpha <- mean(resu[,9], parameter = 3)
+  obs_media_theta_1 <- mean(resu[,13], parameter = 3)
+  obs_media_theta_2 <- mean(resu[,17], parameter = 3)
+  obs_media_theta_3 <- mean(resu[,21], parameter = 3)
+  obs_media_theta_4 <- mean(resu[,25], parameter = 3)
+  obs_media_theta_5 <- mean(resu[,29], parameter = 3)
+  obs_RMSE_beta <- sqrt(mean((resu[,1]-condition$beta)^2))
+  obs_RMSE_omega <- sqrt(mean((resu[,5]-condition$omega)^2))
+  obs_RMSE_alpha <- sqrt(mean((resu[,9]-condition$alpha)^2))
+  obs_RMSE_theta_1 <- sqrt(mean((resu[,13]-condition$theta.1)^2))
+  obs_RMSE_theta_2 <- sqrt(mean((resu[,17]-condition$theta.2)^2))
+  obs_RMSE_theta_3 <- sqrt(mean((resu[,21]-condition$theta.3)^2))
+  obs_RMSE_theta_4 <- sqrt(mean((resu[,25]-condition$theta.4)^2))
+  obs_RMSE_theta_5 <- sqrt(mean((resu[,29]-condition$theta.5)^2))
+  obs_MRE_beta <- mean(resu[,1]/condition$beta)
+  obs_MRE_omega <- mean(resu[,5]/condition$omega)
+  obs_MRE_alpha <- mean(resu[,9]/condition$alpha)
+  obs_MRE_theta_1 <- mean(resu[,13]/condition$theta.1)
+  obs_MRE_theta_2 <- mean(resu[,17]/condition$theta.2)
+  obs_MRE_theta_3 <- mean(resu[,21]/condition$theta.3)
+  obs_MRE_theta_4 <- mean(resu[,25]/condition$theta.4)
+  obs_MRE_theta_5 <- mean(resu[,29]/condition$theta.5)
+  count_beta <- sum(ifelse(condition$beta>resu[2] & condition$beta<resu[4],1,0))
+  count_omega <- sum(ifelse(condition$omega>resu[6] & condition$omega<resu[8],1,0))
+  count_alpha <- sum(ifelse(condition$alpha>resu[10] & condition$alpha<resu[12],1,0))
+  count_theta_1 <- sum(ifelse(condition$theta.1>resu[14] & condition$theta.1<resu[16],1,0))
+  count_theta_2 <- sum(ifelse(condition$theta.2>resu[18] & condition$theta.2<resu[20],1,0))
+  count_theta_3 <- sum(ifelse(condition$theta.3>resu[22] & condition$theta.3<resu[24],1,0))
+  count_theta_4 <- sum(ifelse(condition$theta.4>resu[26] & condition$theta.4<resu[28],1,0))
+  count_theta_5 <- sum(ifelse(condition$theta.5>resu[30] & condition$theta.5<resu[32],1,0))
+  n.obs <- mean(resu[,33])
+  
+  ret <- c(m.beta=obs_media_beta, m.omega=obs_media_omega,m.alpha=obs_media_alpha,m.theta_1=obs_media_theta_1,
+           m.theta_2=obs_media_theta_2,m.theta_3=obs_media_theta_3,m.theta_4=obs_media_theta_4,m.theta_5=obs_media_theta_5,
+           rmse.beta=obs_RMSE_beta, rmse.omega=obs_RMSE_omega,rmse.alpha=obs_RMSE_alpha,rmse.theta_1=obs_RMSE_theta_1,
+           rmse.theta_2=obs_RMSE_theta_2,rmse.theta_3=obs_RMSE_theta_3,rmse.theta_4=obs_RMSE_theta_4,rmse.theta_5=obs_RMSE_theta_5,
+           mre.beta=obs_MRE_beta, mre.omega=obs_MRE_omega,mre.alpha=obs_MRE_alpha,mre.theta_1=obs_MRE_theta_1,
+           mre.theta_2=obs_MRE_theta_2,mre.theta_3=obs_MRE_theta_3,mre.theta_4=obs_MRE_theta_4,mre.theta_5=obs_MRE_theta_5,
+           cp.beta=count_beta/n_row, cp.omega=count_omega/n_row,cp.alpha=count_alpha/n_row,cp.theta_1=count_theta_1/n_row,
+           cp.theta_2=count_theta_2/n_row,cp.theta_3=count_theta_3/n_row,cp.theta_4=count_theta_4/n_row,cp.theta_5=count_theta_5/n_row,
+           n.amostra=n_row, n_obs=n.obs)
+  ret
+}
+
+
+
+#------------------------------------------------
+# Define the design of the simulation parameters
+#------------------------------------------------
+
+Design <- createDesign(
+  #
+  beta = c(1.5),
+  omega = c(0.05),
+  alpha = c(0.2),
+  theta.1 = c(0.4),
+  theta.2 = c(0.45),
+  theta.3 = c(0.5),
+  theta.4 = c(0.55),
+  theta.5 = c(0.6),
+  tau = c(200),
+  k=c(5),
+  m = c(30),
+  g=c(1.5),
+  h=c(1.5)
+)
+
+
+#-------------------------------------------
+# Generate the frailties Z
+#-------------------------------------------
+
+z = generate_z(k = Design$k, alpha = Design$alpha)
+
+
+
+#-------------------------------------------
+# Run simulation 
+#-------------------------------------------
+
+N_rep = 50    # number of replications
+
+simulation = runSimulation(design=Design, replications = N_rep, generate=Generate, analyse=Analyse, summarise=Summarise)
+
+
+
+#-------------------------------------------
+# If you want to save the results:
+#-------------------------------------------
+
+write.csv(simulation, "simulation.csv")
+save.image("simulation.RData")
