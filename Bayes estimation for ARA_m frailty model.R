@@ -15,11 +15,112 @@ library(msm)
 # Event (1 for failure and 0 for truncation).
 
 # n is the number of iterations of the chain
-# Th "parameter"-start are the initial values for the parameters
+# The "parameter"-start are the initial values for the parameters
 # m is the chosen memory of the frailty ARA model
-# "eta" in this code refers to the parameter "omega"
 
-metr0 <- function(n, data, betastart, etastart, thetastart, alphastart, estart, fstart, m) {
+
+#--------------------------------------------#
+#             Auxiliary functions            #
+#--------------------------------------------#
+
+v.age_components <- function(data, theta, beta, m) {
+  K = max(data$System)
+  W = numeric(K)
+  v.age.obs = NULL
+  n_k = NULL
+  #
+  for (k in 1:K) {
+    data.k=data %>% filter(System==k)
+    time.k=data.k$Time
+    time.k.aux=c(0,time.k)
+    t.k.aux=c(rep(0,(m-1)),time.k.aux)
+    n_k[k]=length(time.k[-1])
+    #
+    v.age.k=NULL
+    prev.age.k=NULL
+    for(j in 1:length(time.k)){
+      v.age.k[j]=t.k.aux[j+m]-(1-theta[k])*sum((theta[k]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
+      prev.age.k[j]=t.k.aux[j+m-1]-(1-theta[k])*sum((theta[k]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
+    }
+    v.age.obs.k=v.age.k[-length(v.age.k)]
+    v.age.obs = c(v.age.obs, v.age.obs.k)
+    #
+    W[k] = sum(v.age.k^beta - prev.age.k^beta)
+  }
+  return(list(W = W, vage_obs = v.age.obs, n_k = n_k))
+}
+
+
+log.pi.theta=function(theta,beta,omega,alpha,g,h,m,time.k){
+  time.k.aux=c(0,time.k)
+  t.k.aux=c(rep(0,(m-1)),time.k.aux)
+  n_k=length(time.k[-1])
+  v.age.k=NULL
+  prev.age.k=NULL
+  for(j in 1:length(time.k)){
+    v.age.k[j]=t.k.aux[j+m]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
+    prev.age.k[j]=t.k.aux[j+m-1]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
+  }
+  v.age.obs.k=v.age.k[-length(v.age.k)]
+  #
+  resu =(beta-1)*sum(log(v.age.obs.k)) + (g-1)*log(theta) + (h-1)*log(1-theta) - 
+    (1/alpha+n_k)*sum(log(1+alpha*omega*(sum(v.age.k^beta - prev.age.k^beta))))
+  #
+  return(resu)
+}
+
+
+log.pi.beta=function(omega,beta,alpha,theta,m,data,a,b){
+  N=sum(data$Event)
+  K=max(data$System)
+  #
+  calc=v.age_components(data=data, theta=theta, beta=beta, m=m)
+  #
+  resu.aux= N*log(beta)+(beta-1)*sum(log(calc$vage_obs))-sum((1/alpha+calc$n_k)*log(1+alpha*omega*calc$W))
+  resu = ifelse(between(beta,a,b)==TRUE, resu.aux, 0)
+  return(resu)
+}
+
+
+log.pi.omega=function(omega,beta,alpha,theta,m,data,c,d){
+  N=sum(data$Event)
+  K=max(data$System)
+  #
+  calc=v.age_components(data=data, theta=theta, beta=beta, m=m)
+  #
+  resu = N*log(omega) + (c-1)*log(omega) - d*omega - sum((1/alpha+calc$n_k)*log(1+alpha*omega*calc$W))
+  return(resu)
+}
+
+
+log.pi.alpha=function(alpha,beta,omega,theta,m,data,e,f){
+  N=sum(data$Event)
+  K=max(data$System)
+  #
+  calc=v.age_components(data=data, theta=theta, beta=beta, m=m)
+  #
+  resu =  N*log(alpha) - K*lgamma(1/alpha) + sum(lgamma(1/alpha + calc$n_k)) -
+    sum((1/alpha+calc$n_k)*log(1+alpha*omega*calc$W)) + (e-1)*log(alpha) - f*alpha
+  return(resu)
+}
+
+
+log.pi.g=function(theta,g){
+  (g-1)*sum(log(theta))-(g-1)
+}
+
+
+log.pi.h=function(theta,h){
+  (h-1)*sum(log(1-theta))-(h-1)
+}
+
+
+#--------------------------------------------#
+#               MCMC function                #
+#--------------------------------------------#
+
+metr0 <- function(n, data, betastart, omegastart, thetastart, alphastart, gstart, hstart, m,
+                  a, b, c, d, e, f) {
   data=data
   m=m
   N=sum(data$Event)
@@ -27,16 +128,16 @@ metr0 <- function(n, data, betastart, etastart, thetastart, alphastart, estart, 
   #
   alpha = c(alphastart, rep(NA, n - 1))
   beta = c(betastart, rep(NA, n-1))
-  eta = c(etastart, rep(NA, n-1))
+  omega = c(omegastart, rep(NA, n-1))
   theta = matrix(NA, K, n); theta[ ,1]=thetastart
-  e = c(estart, rep(NA, n-1))
-  f = c(fstart, rep(NA, n-1))
+  g = c(gstart, rep(NA, n-1))
+  h = c(hstart, rep(NA, n-1))
   taxa.alpha = 0
   taxa.beta = 0
-  taxa.eta = 0
+  taxa.omega = 0
   taxa.theta = c(rep(0,K))
-  taxa.e = 0
-  taxa.f = 0
+  taxa.g = 0
+  taxa.h = 0
   #
   for (i in 2:n) {
     
@@ -44,31 +145,12 @@ metr0 <- function(n, data, betastart, etastart, thetastart, alphastart, estart, 
     for(k in 1:K){
       data.k=data %>% filter(System==k)
       time.k=data.k$Time
-      time.k.aux=c(0,time.k)
-      t.k.aux=c(rep(0,(m-1)),time.k.aux)
-      n_k=length(time.k[-1])
-      
-      
-      log.pi.theta=function(theta,beta,eta,alpha,e,f){
-        v.age.k=NULL
-        prev.age.k=NULL
-        for(j in 1:length(time.k)){
-          v.age.k[j]=t.k.aux[j+m]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
-          prev.age.k[j]=t.k.aux[j+m-1]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
-        }
-        v.age.obs.k=v.age.k[-length(v.age.k)]
-        #
-        resu =(beta-1)*sum(log(v.age.obs.k)) + (e-1)*log(theta) + (f-1)*log(1-theta) - 
-          sum((1/alpha+n_k)*log(1+alpha*eta*(sum(v.age.k^beta - prev.age.k^beta))))
-        #
-        return(resu)
-      }
       #
       theta.star = rtnorm(1, theta[k,i-1], 0.2, lower=0, upper=1)
       #
-      log.R.theta = log.pi.theta(theta=theta.star,beta=beta[i-1],eta=eta[i-1],alpha=alpha[i-1],e=e[i-1],f=f[i-1]) -
-        log.pi.theta(theta=theta[k,i-1],beta=beta[i-1],eta=eta[i-1],alpha=alpha[i-1],e=e[i-1],f=f[i-1])
-      
+      log.R.theta = log.pi.theta(theta=theta.star,beta=beta[i-1],omega=omega[i-1],alpha=alpha[i-1],g=g[i-1],h=h[i-1],m=m,time.k=time.k) -
+        log.pi.theta(theta=theta[k,i-1],beta=beta[i-1],omega=omega[i-1],alpha=alpha[i-1],g=g[i-1],h=h[i-1],m=m,time.k=time.k)
+    
       prob.theta = min(1, exp(log.R.theta))
       
       if(is.finite(prob.theta)){
@@ -84,41 +166,11 @@ metr0 <- function(n, data, betastart, etastart, thetastart, alphastart, estart, 
     }
     
     # estimate beta
-    log.pi.beta=function(eta,beta,alpha){
-      W=NULL
-      n_k=NULL
-      v.age.obs=NULL
-      for(k in 1:K){
-        data.k=data %>% filter(System==k)
-        time.k=data.k$Time
-        time.k.aux=c(0,time.k)
-        t.k.aux=c(rep(0,(m-1)),time.k.aux)
-        n_k[k]=length(time.k[-1])
-        #
-        v.age.k=NULL
-        prev.age.k=NULL
-        #
-        for(j in 1:length(time.k)){
-          v.age.k[j]=t.k.aux[j+m]-(1-theta[k,i])*sum((theta[k,i]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
-          prev.age.k[j]=t.k.aux[j+m-1]-(1-theta[k,i])*sum((theta[k,i]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
-        }
-        v.age.obs.k=v.age.k[-length(v.age.k)]
-        
-        W[k] = sum(v.age.k^beta - prev.age.k^beta)
-        
-        v.age.obs=c(v.age.obs,v.age.obs.k)
-      }
-      
-      resu.aux= N*log(beta)+(beta-1)*sum(log(v.age.obs))-sum((1/alpha+n_k)*log(1+alpha*eta*W))
-      resu = ifelse(between(beta,a,b)==TRUE, resu.aux, 0)
-      return(resu)
-    }
-    
     s_d=0.5
     beta.star = rtnorm(1, mean=beta[i-1], sd=s_d, lower=1, upper=3) 
     
-    log.R.beta = log.pi.beta(beta=beta.star,eta=eta[i-1],alpha=alpha[i-1]) - 
-      log.pi.beta(beta=beta[i-1],eta=eta[i-1],alpha=alpha[i-1])
+    log.R.beta = log.pi.beta(beta=beta.star,omega=omega[i-1],alpha=alpha[i-1],theta=theta[,i],m=m,data=data,a=a,b=b) - 
+      log.pi.beta(beta=beta[i-1],omega=omega[i-1],alpha=alpha[i-1],theta=theta[,i],m=m,data=data,a=a,b=b)
     
     prob.beta = min(1, exp(log.R.beta))
     
@@ -133,81 +185,30 @@ metr0 <- function(n, data, betastart, etastart, thetastart, alphastart, estart, 
     }  else { beta[i] = beta[i-1]}
     
     
-    # estimate eta
-    log.pi.eta=function(eta,beta,alpha){
-      W=NULL
-      n_k=NULL
-      v.age.obs=NULL
-      for(k in 1:K){
-        data.k=data %>% filter(System==k)
-        time.k=data.k$Time
-        time.k.aux=c(0,time.k)
-        t.k.aux=c(rep(0,(m-1)),time.k.aux)
-        n_k[k]=length(time.k[-1])
-        #
-        v.age.k=NULL
-        prev.age.k=NULL
-        #
-        for(j in 1:length(time.k)){
-          v.age.k[j]=t.k.aux[j+m]-(1-theta[k,i])*sum((theta[k,i]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
-          prev.age.k[j]=t.k.aux[j+m-1]-(1-theta[k,i])*sum((theta[k,i]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
-        }
-        
-        W[k] = sum(v.age.k^beta - prev.age.k^beta)
-      }
-      resu = N*log(eta) + (c-1)*log(eta) - d*eta - sum((1/alpha+n_k)*log(1+alpha*eta*W))
-      return(resu)
-    }
+    # estimate omega
+    omega.star = rtnorm(1, omega[i-1], 0.01, lower=0, upper=0.1)
     
-    eta.star = rtnorm(1, eta[i-1], 0.01, lower=0, upper=0.2)
+    log.R.omega = log.pi.omega(omega=omega.star,beta=beta[i],alpha=alpha[i-1],theta=theta[,i],m=m,data=data,c=c,d=d) - 
+      log.pi.omega(omega=omega[i-1],beta=beta[i],alpha=alpha[i-1],theta=theta[,i],m=m,data=data,c=c,d=d)
     
-    log.R.eta = log.pi.eta(eta=eta.star,beta=beta[i],alpha=alpha[i-1]) - 
-      log.pi.eta(eta=eta[i-1],beta=beta[i],alpha=alpha[i-1])
+    prob.omega = min(1, exp(log.R.omega))
     
-    prob.eta = min(1, exp(log.R.eta))
-    
-    if(is.finite(prob.eta)){
-      if (runif(1) < prob.eta) {
-        eta[i] = eta.star
-        taxa.eta = taxa.eta + 1
+    if(is.finite(prob.omega)){
+      if (runif(1) < prob.omega) {
+        omega[i] = omega.star
+        taxa.omega = taxa.omega + 1
       }
       else {
-        eta[i] = eta[i-1]
+        omega[i] = omega[i-1]
       }
-    }  else { eta[i] = eta[i-1]}
+    }  else { omega[i] = omega[i-1]}
     
     
     # estimate alpha
-    log.pi.alpha=function(alpha,beta,eta){
-      W=NULL
-      n_k=NULL
-      v.age.obs=NULL
-      for(k in 1:K){
-        data.k=data %>% filter(System==k)
-        time.k=data.k$Time
-        time.k.aux=c(0,time.k)
-        t.k.aux=c(rep(0,(m-1)),time.k.aux)
-        n_k[k]=length(time.k[-1])
-        #
-        v.age.k=NULL
-        prev.age.k=NULL
-        #
-        for(j in 1:length(time.k)){
-          v.age.k[j]=t.k.aux[j+m]-(1-theta[k,i])*sum((theta[k,i]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
-          prev.age.k[j]=t.k.aux[j+m-1]-(1-theta[k,i])*sum((theta[k,i]^(0:(m-1)))*(rev(t.k.aux[j:(j+m-1)])))
-        }
-        
-        W[k] = sum(v.age.k^beta - prev.age.k^beta)
-      }
-      resu =  N*log(alpha) - K*lgamma(1/alpha) + sum(lgamma(1/alpha + n_k)) -
-        sum((1/alpha+n_k)*log(1+alpha*eta*W)) + (r-1)*log(alpha) - s*alpha
-      return(resu)
-    }
+    alpha.star = rtnorm(1, alpha[i-1], 0.5 , lower=0, upper=0.5)
     
-    alpha.star = rtnorm(1, alpha[i-1], 1, lower=0, upper=2)
-    
-    log.R.alpha = log.pi.alpha(alpha=alpha.star,beta=beta[i],eta=eta[i]) - 
-      log.pi.alpha(alpha=alpha[i-1],beta=beta[i],eta=eta[i])
+    log.R.alpha = log.pi.alpha(alpha=alpha.star,beta=beta[i],omega=omega[i],theta=theta[,i],m=m,data=data,e=e,f=f) - 
+      log.pi.alpha(alpha=alpha[i-1],beta=beta[i],omega=omega[i],theta=theta[,i],m=m,data=data,e=e,f=f)
     
     prob.alpha = min(1, exp(log.R.alpha))
     
@@ -221,59 +222,50 @@ metr0 <- function(n, data, betastart, etastart, thetastart, alphastart, estart, 
       }
     }  else { alpha[i] = alpha[i-1]}
     
-    # estimate the hyperparameter "e"
-    s_d=2
-    e.star = rtnorm(1, mean=e[i-1], sd=s_d, lower=1, upper=5) 
     
-    log.pi.e=function(theta,e){
-      (e-1)*sum(log(theta))-(e-1)
-    }
+    # estimate the hyperparameter "g"
+    s_d=1
+    g.star = rtnorm(1, mean=g[i-1], sd=s_d, lower=1, upper=3) 
     
-    log.R.e = log.pi.e(e=e.star,theta=theta[,i])-log.pi.e(e=e[i-1],theta=theta[,i])
+    log.R.g = log.pi.g(g=g.star,theta=theta[,i])-log.pi.g(g=g[i-1],theta=theta[,i])
     
-    prob.e = min(1, exp(log.R.e))
+    prob.g = min(1, exp(log.R.g))
     
-    if(is.finite(prob.e)){
-      if (runif(1) < prob.e) {
-        e[i] = e.star
-        taxa.e = taxa.e + 1
+    if(is.finite(prob.g)){
+      if (runif(1) < prob.g) {
+        g[i] = g.star
+        taxa.g = taxa.g + 1
       }
       else {
-        e[i] = e[i - 1]
+        g[i] = g[i - 1]
       }
-    }  else { e[i] = e[i-1]}
+    }  else { g[i] = g[i-1]}
     
     
-    # estimate the hyperparameter "f"
-    s_d=2
-    f.star = rtnorm(1, mean=f[i-1], sd=s_d, lower=1, upper=5) 
+    # estimate the hyperparameter "h"
+    s_d=1
+    h.star = rtnorm(1, mean=h[i-1], sd=s_d, lower=1, upper=3) 
     
-    log.pi.f=function(theta,f){
-      (f-1)*sum(log(1-theta))-(f-1)
-    }
     
-    log.R.f = log.pi.f(f=f.star,theta=theta[,i])-
-      log.pi.f(f=f[i-1],theta=theta[,i])
+    log.R.h = log.pi.h(h=h.star,theta=theta[,i])-
+      log.pi.h(h=h[i-1],theta=theta[,i])
     
-    prob.f = min(1, exp(log.R.f))
+    prob.h = min(1, exp(log.R.h))
     
-    if(is.finite(prob.f)){
-      if (runif(1) < prob.f) {
-        f[i] = f.star
-        taxa.f = taxa.f + 1
+    if(is.finite(prob.h)){
+      if (runif(1) < prob.h) {
+        h[i] = h.star
+        taxa.h = taxa.h + 1
       }
       else {
-        f[i] = f[i - 1]
+        h[i] = h[i - 1]
       }
-    }  else { f[i] = f[i-1]}
+    }  else { h[i] = h[i-1]}
   }
-  
-  return(list(beta=beta, eta=eta, theta=theta, alpha=alpha, e=e, f=f, 
-              tx.beta=taxa.beta/n, tx.eta=taxa.eta/n, tx.theta=taxa.theta/n, tx.alpha=taxa.alpha/n,
-              tx.e=taxa.e/n, tx.f=taxa.f/n))
+  return(list(beta=beta, omega=omega, theta=theta, alpha=alpha, g=g, h=h, 
+              tx.beta=taxa.beta/n, tx.omega=taxa.omega/n, tx.theta=taxa.theta/n, tx.alpha=taxa.alpha/n,
+              tx.g=taxa.g/n, tx.h=taxa.h/n))
 }
-
-
 
 
 #------------------------------------------------------------------
@@ -283,21 +275,21 @@ metr0 <- function(n, data, betastart, etastart, thetastart, alphastart, estart, 
 
 data=read.table("trucks.txt", head=TRUE)
 
-a=1; b=3; c=0.01; d=1; g=1; h=1; r=1; s=1
-
 memo=32
 
-mm = metr0(n=50000, data=data, betastart=1.5, etastart=0.01, thetastart=c(rep(0.1,5)), 
-           alphastart=0.5, estart=1, fstart=1, m=memo)
+mm = metr0(n=50000, data=data, betastart=1.5, omegastart=0.05, thetastart=c(rep(0.5,5)), 
+           alphastart=0.2, gstart=1.5, hstart=1.5, m=memo, a=1, b=3, c=0.01, d=1, e=1, f=1)
+
 
 x.inf=5000; x.sup=50000
 jump=10
 
+
 alpha1=mm$alpha[seq(x.inf,x.sup,jump)]
 beta1=mm$beta[seq(x.inf,x.sup,jump)]
-eta1=mm$eta[seq(x.inf,x.sup,jump)]
-e1=mm$e[seq(x.inf,x.sup,jump)]
-f1=mm$f[seq(x.inf,x.sup,jump)]
+omega1=mm$omega[seq(x.inf,x.sup,jump)]
+g1=mm$g[seq(x.inf,x.sup,jump)]
+h1=mm$h[seq(x.inf,x.sup,jump)]
 
 theta1.1=mm$theta[1,seq(x.inf,x.sup,jump)]
 theta1.2=mm$theta[2,seq(x.inf,x.sup,jump)]
@@ -305,23 +297,24 @@ theta1.3=mm$theta[3,seq(x.inf,x.sup,jump)]
 theta1.4=mm$theta[4,seq(x.inf,x.sup,jump)]
 theta1.5=mm$theta[5,seq(x.inf,x.sup,jump)]
 
-chain = data.frame(beta=beta1,eta=eta1,alpha=alpha1,theta1=theta1.1,theta2=theta1.2,
+chain = data.frame(beta=beta1,omega=omega1,alpha=alpha1,theta1=theta1.1,theta2=theta1.2,
                    theta3=theta1.3,theta4=theta1.4,theta5=theta1.5)
 
-z = as.mcmc(cbind(beta1,eta1,alpha1, e1, f1, theta1.1,theta1.2,theta1.3,theta1.4,theta1.5))
-colnames(z) = c("Beta", "Eta", "Alpha", "e1", "f1", "Theta.1","Theta.2","Theta.3","Theta.4","Theta.5")
+z = as.mcmc(cbind(beta1,omega1,alpha1, g1, h1, theta1.1,theta1.2,theta1.3,theta1.4,theta1.5))
+colnames(z) = c("Beta", "Omega", "Alpha", "g1", "h1", "Theta.1","Theta.2","Theta.3","Theta.4","Theta.5")
 
 chain_summary = summary(window(z, start = 1))
 print(chain_summary, digits = 3)
 
 beta.est=chain_summary$statistics[1,1]
-eta.est=chain_summary$statistics[2,1]
+omega.est=chain_summary$statistics[2,1]
 alpha.est=chain_summary$statistics[3,1]
-e.est=chain_summary$statistics[4,1]
-f.est=chain_summary$statistics[5,1]
+g.est=chain_summary$statistics[4,1]
+h.est=chain_summary$statistics[5,1]
 theta.est=as.numeric(chain_summary$statistics[6:10,1])
 
-estimates = c(beta.est, eta.est, alpha.est, e.est, f.est, theta.est)
+
+estimates = c(beta.est, omega.est, alpha.est, g.est, h.est, theta.est)
 estimates
 
 
@@ -335,14 +328,14 @@ estimates
 # PLP functions
 #-------------------------------------------
 
-lambda.est=function(t, beta, eta){
-  resu=(beta*eta)*(t^(beta-1))
+lambda.est=function(t, beta, omega){
+  resu=(beta*omega)*(t^(beta-1))
   return(resu)
 }
 
 
-Lambda.est=function(t, beta, eta){
-  resu=eta*(t^beta)
+Lambda.est=function(t, beta, omega){
+  resu=omega*(t^beta)
   return(resu)
 }
 
@@ -352,18 +345,18 @@ Lambda.est=function(t, beta, eta){
 # ARA_m functions
 #-------------------------------------------
 
-lambda.aram.est=function(time, m, beta, eta, theta){
+lambda.aram.est=function(time, m, beta, omega, theta){
   time.aux=c(0,time)
   t.aux=c(rep(0,(m-1)),time.aux)
   v.age=NULL
   for(i in 1:length(time)){
     v.age[i]=t.aux[i+m]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.aux[i:(i+m-1)])))
   }
-  value=lambda.est(t=v.age, beta=beta, eta=eta)
+  value=lambda.est(t=v.age, beta=beta, omega=omega)
   return(value)
 }
 
-Lambda.aram.est<-function(time,m, beta, eta, theta){
+Lambda.aram.est<-function(time,m, beta, omega, theta){
   time.aux=c(0,time)
   t.aux=c(rep(0,(m-1)),time.aux)
   v.age=NULL
@@ -372,8 +365,8 @@ Lambda.aram.est<-function(time,m, beta, eta, theta){
   for(i in 1:length(time)){
     v.age[i]=t.aux[i+m]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.aux[i:(i+m-1)])))
     v.age.aux[i]=t.aux[i+m-1]-(1-theta)*sum((theta^(0:(m-1)))*(rev(t.aux[i:(i+m-1)])))
-    resu.aux[i]=Lambda.est(t=v.age[i],beta=beta,eta=eta)-
-      Lambda.est(t=v.age.aux[i],beta=beta,eta=eta)
+    resu.aux[i]=Lambda.est(t=v.age[i],beta=beta,omega=omega)-
+      Lambda.est(t=v.age.aux[i],beta=beta,omega=omega)
   }
   resu=cumsum(resu.aux)
   return(resu)
@@ -387,7 +380,7 @@ LogLik.shared.ara <- function(par, par.fix=NULL, data, m=1) {
   k=max(data$System)
   #
   beta = par[1]
-  eta = par[2]
+  omega = par[2]
   alpha = par[3]
   theta = par[4:(3+k)]
   #
@@ -401,10 +394,10 @@ LogLik.shared.ara <- function(par, par.fix=NULL, data, m=1) {
     n_i=length(time.ant[-1])
     
     lambda.aux = 
-      lambda.aram.est(time=time.ant, eta=eta, beta=beta, theta=theta[j], m=m)
+      lambda.aram.est(time=time.ant, omega=omega, beta=beta, theta=theta[j], m=m)
     Lambda.aux = 
-      Lambda.aram.est(t=time.obs, eta=eta, beta=beta, theta=theta[j], m=m) - 
-      Lambda.aram.est(t=time.ant, eta=eta, beta=beta, theta=theta[j], m=m)
+      Lambda.aram.est(t=time.obs, omega=omega, beta=beta, theta=theta[j], m=m) - 
+      Lambda.aram.est(t=time.ant, omega=omega, beta=beta, theta=theta[j], m=m)
     
     lambda.aux = ifelse(lambda.aux<0, 1, lambda.aux)
     log.lambda.aux = log(lambda.aux)
@@ -435,7 +428,7 @@ for(i in 1:N.efect){
 
 m.l.chain=mean(l.chain)
 
-vero= -LogLik.shared.ara(par=c(beta.est, eta.est, alpha.est, 
+vero= -LogLik.shared.ara(par=c(beta.est, omega.est, alpha.est, 
                                theta.est[1],theta.est[2],theta.est[3],
                                theta.est[4],theta.est[5]),data=data,m=memo)
 
@@ -452,29 +445,31 @@ plot(z)
 geweke.diag(z)
 heidel.diag(z)
 
-#Gelman-Rubi
+#Gelman-Rubin
 beta = runif(1,1,3)
-eta = runif(1,0,0.1)
+omega = runif(1,0,0.1)
 alpha = runif(1,0,2)
-e=runif(1,1,3)
-f=runif(1,1,3)
+g=runif(1,1,3)
+h=runif(1,1,3)
 theta1=runif(1,0,1)
 theta2=runif(1,0,1)
 theta3=runif(1,0,1)
 theta4=runif(1,0,1)
 theta5=runif(1,0,1)
 
-mm1=metr0(n=50000, data=data, betastart=beta, etastart=eta, alphastart=alpha,
-          thetastart=c(theta1,theta2,theta3,theta4,theta5), estart=e, fstart=f, m=32)
+mm1=metr0(n=50000, data=data, betastart=beta, omegastart=omega, alphastart=alpha,
+          thetastart=c(theta1,theta2,theta3,theta4,theta5), gstart=g, hstart=h, m=32,
+          a=1, b=3, c=0.01, d=1, e=1, f=1)
+
 x.inf=5000
 x.sup=50000
 jump=10
 
 alpha1=mm1$alpha[seq(x.inf,x.sup,jump)]
 beta1=mm1$beta[seq(x.inf,x.sup,jump)]
-eta1=mm1$eta[seq(x.inf,x.sup,jump)]
-e1=mm1$e[seq(x.inf,x.sup,jump)]
-f1=mm1$f[seq(x.inf,x.sup,jump)]
+omega1=mm1$omega[seq(x.inf,x.sup,jump)]
+g1=mm1$g[seq(x.inf,x.sup,jump)]
+h1=mm1$h[seq(x.inf,x.sup,jump)]
 
 theta1.1=mm1$theta[1,seq(x.inf,x.sup,jump)]
 theta1.2=mm1$theta[2,seq(x.inf,x.sup,jump)]
@@ -482,8 +477,8 @@ theta1.3=mm1$theta[3,seq(x.inf,x.sup,jump)]
 theta1.4=mm1$theta[4,seq(x.inf,x.sup,jump)]
 theta1.5=mm1$theta[5,seq(x.inf,x.sup,jump)]
 
-zz = as.mcmc(cbind(beta1,eta1,alpha1, e1, f1, theta1.1,theta1.2,theta1.3,theta1.4,theta1.5))
-colnames(zz) = c("Beta", "Eta", "Alpha", "e1", "f1", "Theta.1","Theta.2","Theta.3","Theta.4","Theta.5")
+zz = as.mcmc(cbind(beta1,omega1,alpha1, g1, h1, theta1.1,theta1.2,theta1.3,theta1.4,theta1.5))
+colnames(zz) = c("beta", "omega", "Alpha", "g1", "h1", "theta.1","theta.2","theta.3","theta.4","theta.5")
 
 combinedchains = mcmc.list(z, zz)
 gelman.diag(combinedchains)
